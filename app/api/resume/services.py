@@ -331,11 +331,12 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
 
     extracted_name = parsed_resume_data.get("basic_details", {}).get("name", "").strip()
     if extracted_name and extracted_name != "N/A":
-        sanitized_name = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_')
-        output_filename = f"{sanitized_name}_resume.json"
+        # Convert the sanitized name to uppercase before creating the filename
+        sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
+        output_filename = f"{sanitized_name_upper}_RESUME.json" # Also make "_RESUME.json" uppercase for consistency
         logger.info(f"Generated output filename: '{output_filename}' based on extracted name.")
     else:
-        output_filename = f"parsed_resume.json"
+        output_filename = f"PARSED_RESUME.json" # Default filename in uppercase
         logger.warning(f"Could not extract name from resume '{original_filename}'. Defaulting output filename to '{output_filename}'.")
 
     return {
