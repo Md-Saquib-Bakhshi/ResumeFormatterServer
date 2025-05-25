@@ -1,3 +1,4 @@
+import io
 import re
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
@@ -6,11 +7,15 @@ import logging
 import asyncio
 import os
 import tempfile
-from typing import List, Tuple
+from typing import List, Tuple, Literal
 
 # Import the service functions and job manager
 from . import services
 from ...utils.job_manager import job_manager, JobStatus
+
+# Import the new generation functions from their dedicated files
+from .generators.docx_generator import generate_docx_from_json
+from .generators.pdf_generator import generate_pdf_from_json
 
 logger = logging.getLogger(__name__) # Get a logger instance for this module
 
@@ -117,10 +122,13 @@ async def get_job_status(job_id: str):
 
 
 @router.get("/download/{job_id}")
-async def download_job_results(job_id: str):
+async def download_job_results(
+    job_id: str,
+    format: Literal["json", "pdf", "docx"] = "json" # Added format query parameter
+):
     """
     Downloads the processed results for a completed job.
-    Returns a ZIP file for multiple files, or a single JSON for one file.
+    Returns a ZIP file for multiple files, or a single JSON/PDF/DOCX for one file.
     """
     job = job_manager.get_job(job_id)
     if not job:
@@ -134,42 +142,86 @@ async def download_job_results(job_id: str):
             detail=f"Job '{job_id}' is not yet completed. Current status: {job['status']}."
         )
 
-    # Check if a ZIP file path exists (means it was a multi-file job or explicitly zipped)
-    if job.get("zip_file_path") and os.path.exists(job["zip_file_path"]):
-        zip_path = job["zip_file_path"]
-        logger.info(f"Serving ZIP file for job '{job_id}' from path: {zip_path}")
-
-        # Use BackgroundTasks to clean up the temporary zip file after it's sent
-        def cleanup_zip():
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-                logger.info(f"Cleaned up temporary ZIP file: {zip_path}")
+    # Handle multi-file jobs (always return ZIP of JSONs)
+    if len(job["original_filenames"]) > 1:
+        if format != "json":
+            logger.warning(f"Format '{format}' requested for multi-file job '{job_id}'. Returning ZIP of JSONs by default.")
         
-        response = FileResponse(
-            path=zip_path,
-            media_type="application/zip",
-            filename=f"RESUME_PARSE_RESULTS_{job_id}.zip"
-        )
-        response.background = BackgroundTasks([cleanup_zip])
-        return response
+        if job.get("zip_file_path") and os.path.exists(job["zip_file_path"]):
+            zip_path = job["zip_file_path"]
+            logger.info(f"Serving ZIP file for job '{job_id}' from path: {zip_path}")
+
+            # Define the cleanup function as async
+            async def cleanup_zip_async():
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                    logger.info(f"Cleaned up temporary ZIP file: {zip_path}")
+            
+            response = FileResponse(
+                path=zip_path,
+                media_type="application/zip",
+                filename=f"RESUME_PARSE_RESULTS_{job_id}.zip"
+            )
+            # Assign the async cleanup function to background tasks
+            response.background = BackgroundTasks([cleanup_zip_async])
+            return response
+        else:
+            logger.error(f"Job '{job_id}' completed (multi-file), but no ZIP file path found or file missing.")
+            raise HTTPException(status_code=500, detail="Results ZIP file not found for multi-file job.")
     
-    # If it was a single file upload, return the JSON directly
+    # Handle single-file jobs
     elif len(job["results"]) == 1 and job["results"][0].get("parsed_data"):
         single_result = job["results"][0]["parsed_data"]
         original_fname = job["results"][0].get("original_filename", "parsed_result")
         
         extracted_name = single_result.get("basic_details", {}).get("name", "").strip()
+        
+        # Determine base filename for download (e.g., "JOHN_DOE_RESUME" or "PARSED_MY_FILE_RESUME")
         if extracted_name and extracted_name != "N/A":
             sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
-            output_filename = f"{sanitized_name_upper}_RESUME.json"
+            base_filename = f"{sanitized_name_upper}_RESUME"
         else:
             name_part = os.path.splitext(original_fname)[0]
             sanitized_name_part = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_').upper()
-            output_filename = f"PARSED_{sanitized_name_part}_RESUME.json"
+            base_filename = f"PARSED_{sanitized_name_part}_RESUME"
 
-        logger.info(f"Serving single JSON result for job '{job_id}' as '{output_filename}'.")
-        return JSONResponse(content=single_result, media_type="application/json", headers={"Content-Disposition": f"attachment; filename=\"{output_filename}\""})
-    
+        if format == "json":
+            output_filename = f"{base_filename}.json"
+            logger.info(f"Serving single JSON result for job '{job_id}' as '{output_filename}'.")
+            return JSONResponse(content=single_result, media_type="application/json", headers={"Content-Disposition": f"attachment; filename=\"{output_filename}\""})
+        
+        elif format == "pdf":
+            try:
+                # Run synchronous PDF generation in a separate thread to avoid blocking the event loop
+                pdf_bytes = await asyncio.to_thread(generate_pdf_from_json, single_result)
+                output_filename = f"{base_filename}.pdf"
+                logger.info(f"Serving single PDF result for job '{job_id}' as '{output_filename}'.")
+                return FileResponse(
+                    content=io.BytesIO(pdf_bytes), # FileResponse expects a file-like object or path
+                    media_type="application/pdf",
+                    filename=output_filename,
+                    headers={"Content-Length": str(len(pdf_bytes))} # Essential for proper download
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate PDF for job '{job_id}': {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {e}")
+
+        elif format == "docx":
+            try:
+                # Run synchronous DOCX generation in a separate thread
+                docx_bytes = await asyncio.to_thread(generate_docx_from_json, single_result)
+                output_filename = f"{base_filename}.docx"
+                logger.info(f"Serving single DOCX result for job '{job_id}' as '{output_filename}'.")
+                return FileResponse(
+                    content=io.BytesIO(docx_bytes),
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    filename=output_filename,
+                    headers={"Content-Length": str(len(docx_bytes))}
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate DOCX for job '{job_id}': {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Failed to generate DOCX: {e}")
+
     else:
-        logger.error(f"Job '{job_id}' completed, but no downloadable results found or format unexpected.")
+        logger.error(f"Job '{job_id}' completed, but no downloadable results found or format unexpected for single file.")
         raise HTTPException(status_code=500, detail="Results not available in expected format for download.")
