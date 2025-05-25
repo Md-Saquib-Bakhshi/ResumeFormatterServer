@@ -48,7 +48,7 @@ LLM_RESUME_PARSING_PROMPT = """You are a Resume Data Extractor. When given a raw
       "date": "string" // if no date is given, set to "N/A"
     }
   ],
-  "professional_summary": "string", // summary or profile paragraph; if absent, "N/A"
+  "professional_summary": "string", // A concise, high-level overview or narrative paragraph(s) of the candidate's career, key qualifications, and objectives. This may also be presented as high-level bullet points summarizing their overall profile. Look for sections like "Summary", "Professional Summary", "Profile", "About Me", etc. This field should NOT contain granular technical skills (which belong in 'technical_expertise') nor detailed job responsibilities (which belong in 'professional_experience'). If absent, "N/A".
   "professional_experience": [
     {
       "company": "string",
@@ -68,4 +68,7 @@ LLM_RESUME_PARSING_PROMPT = """You are a Resume Data Extractor. When given a raw
 2. **Technical expertise:** Normalize to an array of individual technologies/frameworks/tools.
 3. **Certifications:** Extract title and date if possible; otherwise date → `"N/A"`.
 4. **Sort** the `professional_experience` array in **descending** order of the number of responsibilities (i.e. experiences with more responsibilities come first).
-5. **Strict JSON only:** Do not output any explanatory text or markdown—just the JSON."""
+5. **Strict JSON only:** Do not output any explanatory text or markdown—just the JSON.
+6. **Professional Summary:** Extract the overarching summary/profile section(s). This may be titled "Summary", "Professional Summary", "Profile", "About Me", etc. It should be a high-level narrative or key bullet points about the candidate's career and objectives. If multiple such sections are present, combine them into a single string. Do not include granular technical skills (for 'technical_expertise') or specific job duties (for 'professional_experience') in this field.
+
+"""
