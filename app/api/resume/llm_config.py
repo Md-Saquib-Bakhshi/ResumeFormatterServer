@@ -2,34 +2,29 @@ import os
 from openai import AzureOpenAI
 
 # --- Azure OpenAI Configuration ---
-# Fetch credentials from environment variables.
-# It's best practice to load these from environment variables for security and flexibility.
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
-# Validate that all necessary environment variables are set.
-# This check should ideally happen at application startup (e.g., in main.py's lifespan event)
-# to prevent the app from starting if credentials are missing.
-if not all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_DEPLOYMENT_NAME, AZURE_OPENAI_API_VERSION]):
-    # Raising an error here prevents the app from running with misconfigured LLM
-    raise ValueError(
-        "Missing Azure OpenAI environment variables. Please set "
-        "AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_DEPLOYMENT_NAME, "
-        "and AZURE_OPENAI_API_VERSION."
-    )
+# Initialize azure_openai_client. It will be None if credentials are not fully set.
+azure_openai_client = None
+if all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_DEPLOYMENT_NAME, AZURE_OPENAI_API_VERSION]):
+    try:
+        azure_openai_client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_version=AZURE_OPENAI_API_VERSION
+        )
+        print("INFO: Azure OpenAI client initialized successfully.")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize Azure OpenAI client: {e}")
+        azure_openai_client = None
+else:
+    print("WARNING: Azure OpenAI environment variables are not fully set. LLM functionality will be disabled.")
 
-# Initialize the Azure OpenAI client globally.
-# This client will be reused across all LLM calls to avoid re-initialization overhead.
-azure_openai_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_OPENAI_API_VERSION
-)
 
-# Define the LLM prompt here. This keeps the prompt content centralized and easily modifiable.
-# Using a triple-quoted string for multi-line clarity.
+# Define the LLM prompt here.
 LLM_RESUME_PARSING_PROMPT = """You are a Resume Data Extractor. When given a raw resume (plain text, PDF-OCR, or DOCX), you must output **only** a JSON object with the following schema:
 
 {

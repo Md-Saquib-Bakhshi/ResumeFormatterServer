@@ -8,19 +8,30 @@ router = APIRouter()
 @router.post("/upload-resume")
 async def upload_resume(file: UploadFile = File(...)):
     """
-    Handles the resume upload, delegates processing to the service layer,
-    and returns the parsed resume data with a dynamic filename.
+    Handles the resume upload, now supporting various document types (PDF, DOC, DOCX).
+    Processes based on file type (direct text extraction for Word docs, PDF/OCR for PDFs),
+    delegates processing to the service layer, and returns the parsed resume data
+    with a dynamic filename.
     """
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+    # Define allowed content types
+    ALLOWED_CONTENT_TYPES = {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # .docx
+        "application/msword" # .doc 
+    }
+
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file type: {file.content_type}. Only PDF, DOCX, and DOC are accepted."
+        )
 
     try:
-        pdf_bytes = await file.read()
+        file_bytes = await file.read()
         
-        # Delegate the core processing logic to the service layer
-        result = await services.process_resume_pdf(pdf_bytes)
+        # Delegate the document processing to the service layer, passing content_type
+        result = await services.process_resume_document(file_bytes, file.filename, file.content_type)
         
-        # Return the simplified response as requested
         return {
             "filename": result["filename"],
             "parsed_resume_data": result["parsed_resume_data"]
@@ -28,4 +39,11 @@ async def upload_resume(file: UploadFile = File(...)):
 
     except Exception as e:
         print(f"FATAL ERROR during resume processing: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+        # Provide a general internal server error message
+        if "Azure OpenAI client is not initialized" in str(e):
+             raise HTTPException(
+                status_code=500,
+                detail="LLM service is not configured. Please ensure Azure OpenAI environment variables are set."
+             )
+        else:
+            raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
