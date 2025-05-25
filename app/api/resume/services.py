@@ -5,6 +5,9 @@ import concurrent.futures
 import re
 import os
 import logging
+import zipfile
+import tempfile
+from typing import List, Dict, Any, Tuple
 
 from PIL import Image
 import numpy as np
@@ -12,9 +15,11 @@ import fitz # PyMuPDF
 import easyocr
 from docx import Document # For .docx files
 from pydocx import PyDocX # For .doc files
+import aiofiles # For async file I/O
 
 # Import the configured LLM client and prompt from utils
 from .llm_config import azure_openai_client, AZURE_DEPLOYMENT_NAME, LLM_RESUME_PARSING_PROMPT
+from ...utils.job_manager import job_manager, JobStatus # Import job manager
 
 logger = logging.getLogger(__name__) # Get a logger instance for this module
 
@@ -24,12 +29,12 @@ reader = easyocr.Reader(['en'])
 # Initialize a global thread pool for running synchronous OCR and LLM calls.
 ocr_llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
+async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Internal helper to call Azure OpenAI for structured resume data extraction.
     This function is designed to be run within a thread pool executor.
+    Returns parsed data and usage info.
     """
-    # Check if LLM client was successfully initialized
     if azure_openai_client is None:
         logger.error("Azure OpenAI client is not initialized. Cannot perform LLM call.")
         raise RuntimeError("Azure OpenAI client is not initialized. Please set up API credentials.")
@@ -41,6 +46,8 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
         {"role": "user", "content": f"Resume Text:\n\n{resume_text}\n\nExtract the structured resume data:"}
     ]
 
+    llm_output_str = ""
+    usage_info = {}
     try:
         response = await loop.run_in_executor(
             ocr_llm_executor,
@@ -53,16 +60,14 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
             )
         )
         
-        # --- Token Usage Tracking ---
         if response.usage:
-            logger.info(
-                f"LLM Token Usage: Prompt Tokens={response.usage.prompt_tokens}, "
-                f"Completion Tokens={response.usage.completion_tokens}, "
-                f"Total Tokens={response.usage.total_tokens}"
-            )
+            usage_info = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
         else:
             logger.warning("LLM response did not contain usage information.")
-        # --- End Token Usage Tracking ---
 
         llm_output_str = response.choices[0].message.content
         llm_data = json.loads(llm_output_str)
@@ -137,26 +142,14 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
             reverse=True
         )
         
-        return parsed_resume
+        return parsed_resume, usage_info
 
     except json.JSONDecodeError as e:
         logger.error(f"LLM did not return valid JSON. Raw output: {llm_output_str if 'llm_output_str' in locals() else 'N/A'}. Error: {e}", exc_info=True)
-        return {
-            "basic_details": {"name": "N/A", "email": "N/A", "phone": "N/A", "links": {}},
-            "technical_expertise": [],
-            "certifications": [],
-            "professional_summary": "N/A",
-            "professional_experience": []
-        }
+        raise ValueError(f"LLM response error: {e}")
     except Exception as e:
         logger.error(f"Failed to call Azure OpenAI or process its response: {e}", exc_info=True)
-        return {
-            "basic_details": {"name": "N/A", "email": "N/A", "phone": "N/A", "links": {}},
-            "technical_expertise": [],
-            "certifications": [],
-            "professional_summary": "N/A",
-            "professional_experience": []
-        }
+        raise ValueError(f"LLM call error: {e}")
 
 
 def _extract_text_from_docx(doc_bytes: bytes) -> str:
@@ -199,19 +192,17 @@ def _extract_text_from_doc(doc_bytes: bytes) -> str:
     return text_content
 
 
-async def process_resume_document(file_bytes: bytes, original_filename: str, content_type: str) -> dict:
+async def process_single_resume_file(
+    file_bytes: bytes, original_filename: str, content_type: str
+) -> Dict[str, Any]:
     """
-    Handles the entire pipeline for any document type:
-    - If PDF: extracts native text and performs OCR on images within the PDF.
-    - If DOCX/DOC: extracts plain text directly (no OCR on embedded images).
-    - Combines all extracted text.
-    - Calls the LLM to parse the combined text into structured JSON.
-    - Generates a filename based on the extracted name.
+    Processes a single resume file (PDF, DOCX, DOC) to extract structured data.
+    This is now a helper for batch processing.
     """
     all_extracted_text_segments = []
 
     if content_type == "application/pdf":
-        logger.info(f"Processing '{original_filename}' as PDF.")
+        logger.info(f"Starting PDF text extraction and OCR for '{original_filename}'.")
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         loop = asyncio.get_event_loop()
         ocr_tasks = []
@@ -227,9 +218,9 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
             perform_full_page_ocr = False
             native_text_len = len(text_from_pdf_layer.strip())
 
-            if native_text_len < 100:
+            if native_text_len < 100: # Heuristic: if very little native text, perform full OCR
                 perform_full_page_ocr = True
-            else:
+            else: # Heuristic: if common sections missing from native text, full OCR might catch them
                 common_section_keywords = ["experience", "education", "skills", "certifications", "summary", "projects", "awards", "licenses"]
                 if not any(keyword in text_from_pdf_layer.lower() for keyword in common_section_keywords):
                     perform_full_page_ocr = True 
@@ -288,7 +279,7 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
 
         doc.close()
 
-        logger.info(f"Waiting for all OCR tasks for '{original_filename}' to complete...")
+        logger.info(f"Waiting for OCR tasks for '{original_filename}' to complete...")
         completed_ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
         logger.info(f"All OCR tasks for '{original_filename}' completed.")
 
@@ -302,44 +293,127 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                     all_extracted_text_segments.append(combined_ocr_text_segment)
 
     elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        logger.info(f"Processing '{original_filename}' as DOCX (direct text extraction).")
-        try:
-            all_extracted_text_segments.append(_extract_text_from_docx(file_bytes))
-            logger.info(f"Text extracted from DOCX '{original_filename}'.")
-        except ValueError as e:
-            logger.error(f"Failed to extract text from DOCX '{original_filename}': {e}", exc_info=True)
-            raise # Re-raise to be caught by the router
+        logger.info(f"Starting DOCX text extraction for '{original_filename}'.")
+        all_extracted_text_segments.append(_extract_text_from_docx(file_bytes))
+        logger.info(f"Text extracted from DOCX '{original_filename}'.")
         
     elif content_type == "application/msword":
-        logger.info(f"Processing '{original_filename}' as DOC (direct text extraction).")
-        try:
-            all_extracted_text_segments.append(_extract_text_from_doc(file_bytes))
-            logger.info(f"Text extracted from DOC '{original_filename}'.")
-        except ValueError as e:
-            logger.error(f"Failed to extract text from DOC '{original_filename}': {e}", exc_info=True)
-            raise # Re-raise to be caught by the router
+        logger.info(f"Starting DOC text extraction for '{original_filename}'.")
+        all_extracted_text_segments.append(_extract_text_from_doc(file_bytes))
+        logger.info(f"Text extracted from DOC '{original_filename}'.")
 
     else:
         logger.error(f"Unsupported content type '{content_type}' for '{original_filename}'.")
-        raise ValueError(f"Unsupported content type for processing: {content_type}")
+        raise ValueError(f"Unsupported file type for processing: {content_type}")
 
     full_resume_text = "\n".join(all_extracted_text_segments)
 
-    logger.info(f"Calling LLM for full resume parsing for '{original_filename}'...")
-    parsed_resume_data = await _call_llm_for_resume_parsing(full_resume_text)
+    logger.info(f"Calling LLM for '{original_filename}'...")
+    parsed_resume_data, usage_info = await _call_llm_for_resume_parsing(full_resume_text)
     logger.info(f"LLM parsing completed for '{original_filename}'.")
 
     extracted_name = parsed_resume_data.get("basic_details", {}).get("name", "").strip()
-    if extracted_name and extracted_name != "N/A":
-        # Convert the sanitized name to uppercase before creating the filename
-        sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
-        output_filename = f"{sanitized_name_upper}_RESUME.json" # Also make "_RESUME.json" uppercase for consistency
-        logger.info(f"Generated output filename: '{output_filename}' based on extracted name.")
-    else:
-        output_filename = f"PARSED_RESUME.json" # Default filename in uppercase
-        logger.warning(f"Could not extract name from resume '{original_filename}'. Defaulting output filename to '{output_filename}'.")
-
+    
+    # Store the original filename and the parsed data
     return {
-        "filename": output_filename,
-        "parsed_resume_data": parsed_resume_data
+        "original_filename": original_filename,
+        "content_type": content_type,
+        "parsed_data": parsed_resume_data,
+        "llm_usage": usage_info
     }
+
+
+async def process_batch_of_resumes(job_id: str, file_paths_and_types: List[Tuple[str, str, str]]):
+    """
+    Background task to process a batch of resume files.
+    Updates job status and stores results in the JobManager.
+    """
+    job_manager.update_job_status(job_id, JobStatus.PROCESSING)
+    results = []
+    
+    total_files = len(file_paths_and_types)
+    processed_count = 0
+
+    try:
+        for file_idx, (file_path, original_filename, content_type) in enumerate(file_paths_and_types):
+            logger.info(f"Job '{job_id}': Processing file {file_idx + 1}/{total_files}: '{original_filename}'.")
+            
+            async with aiofiles.open(file_path, 'rb') as f:
+                file_bytes = await f.read()
+            
+            try:
+                single_file_result = await process_single_resume_file(file_bytes, original_filename, content_type)
+                results.append(single_file_result)
+                logger.info(f"Job '{job_id}': Successfully processed '{original_filename}'.")
+            except Exception as e:
+                logger.error(f"Job '{job_id}': Error processing '{original_filename}': {e}", exc_info=True)
+                results.append({
+                    "original_filename": original_filename,
+                    "status": "FAILED",
+                    "error_message": str(e),
+                    "parsed_data": None,
+                    "llm_usage": None
+                })
+            finally:
+                # Clean up the temporary file immediately after processing
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.debug(f"Job '{job_id}': Cleaned up temporary file '{file_path}'.")
+                
+                processed_count += 1
+                progress = int((processed_count / total_files) * 100)
+                job_manager.update_job_status(job_id, JobStatus.PROCESSING, progress=progress)
+
+        # Generate ZIP file if there's more than one result or if it's explicitly requested as batch
+        if total_files > 1 or (total_files == 1 and job_manager.get_job(job_id)['original_filenames'] != [results[0]['original_filename']]):
+            zip_file_name = f"parsed_resumes_{job_id}.zip"
+            # Use tempfile to create a temporary zip file path
+            temp_zip_fd, temp_zip_path = tempfile.mkstemp(suffix=".zip")
+            os.close(temp_zip_fd) # Close the file descriptor immediately
+
+            try:
+                with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for result_item in results:
+                        parsed_data = result_item.get("parsed_data")
+                        original_fname = result_item.get("original_filename", "unknown_file")
+                        
+                        # Generate unique filename for JSON inside zip
+                        extracted_name = parsed_data.get("basic_details", {}).get("name", "").strip() if parsed_data else ""
+                        if extracted_name and extracted_name != "N/A":
+                            sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
+                            json_filename = f"{sanitized_name_upper}_RESUME.json"
+                        else:
+                            # Fallback if name not found, use original filename parts
+                            name_part = os.path.splitext(original_fname)[0]
+                            sanitized_name_part = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_').upper()
+                            json_filename = f"PARSED_{sanitized_name_part}_RESUME.json"
+                        
+                        # Handle potential duplicate filenames in zip
+                        counter = 1
+                        final_json_filename = json_filename
+                        while final_json_filename in zf.namelist():
+                            base, ext = os.path.splitext(json_filename)
+                            final_json_filename = f"{base}_{counter}{ext}"
+                            counter += 1
+
+                        json_content = json.dumps(parsed_data, indent=2, ensure_ascii=False)
+                        zf.writestr(final_json_filename, json_content)
+                        logger.info(f"Added '{final_json_filename}' to zip for job '{job_id}'.")
+                
+                job_manager.update_job_status(job_id, JobStatus.COMPLETED, results=results, zip_file_path=temp_zip_path, progress=100)
+                logger.info(f"Job '{job_id}' completed. ZIP file created at: {temp_zip_path}")
+            except Exception as zip_e:
+                logger.error(f"Job '{job_id}': Failed to create ZIP file: {zip_e}", exc_info=True)
+                job_manager.update_job_status(job_id, JobStatus.FAILED, error_message=f"Failed to create ZIP: {zip_e}", results=results)
+                # Ensure temporary zip is cleaned if creation failed
+                if os.path.exists(temp_zip_path):
+                    os.remove(temp_zip_path)
+
+        # If it's a single file and no ZIP was generated (e.g. error, or not requested as batch)
+        elif total_files == 1:
+            job_manager.update_job_status(job_id, JobStatus.COMPLETED, results=results, progress=100)
+            logger.info(f"Job '{job_id}' completed with single file result.")
+            
+    except Exception as e:
+        logger.error(f"Job '{job_id}': An unexpected error occurred during batch processing: {e}", exc_info=True)
+        job_manager.update_job_status(job_id, JobStatus.FAILED, error_message=f"Batch processing failed: {e}")
