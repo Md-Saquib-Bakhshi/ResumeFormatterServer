@@ -1,6 +1,5 @@
 import io
 import re
-import uuid
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -9,11 +8,13 @@ import asyncio
 import os
 import tempfile
 import shutil # For cleaning up temporary directories
+import uuid # Import uuid for job_id generation
 from typing import List, Tuple
 
 # Import the service functions and job manager
 from . import services
-from ...utils.job_manager import job_manager, JobStatus
+# Update import for OutputFormat
+from ...utils.job_manager import job_manager, JobStatus, OutputFormat 
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ async def upload_resumes(
     files: List[UploadFile] = File(...)
 ):
     """
-    Handles multiple resume uploads. Files are saved temporarily, and processing
+    Handles multiple resume uploads for PDF output. Files are saved temporarily, and processing
     is delegated to a background task. Returns a job ID to poll for status.
     All successful outputs will be a ZIP file containing PDFs.
     """
@@ -67,16 +68,16 @@ async def upload_resumes(
             files_to_process.append((temp_file_path, file.filename, file.content_type))
             logger.info(f"File '{file.filename}' saved temporarily to '{temp_file_path}'.")
 
-        # Create a new job with the manager, passing the temp_dir
-        job_id = str(uuid.uuid4()) # Generate job_id here
-        job_manager.create_job(job_id, original_filenames, temp_dir) # Pass job_id and temp_dir
+        # Create a new job with the manager, specifying PDF output
+        job_id = str(uuid.uuid4())
+        job_manager.create_job(job_id, original_filenames, temp_dir, target_format=OutputFormat.PDF) 
 
         # Schedule the processing as a background task
         background_tasks.add_task(services.process_batch_of_resumes, job_id, files_to_process, temp_dir)
         
-        logger.info(f"Batch processing job '{job_id}' initiated for {len(files)} files.")
+        logger.info(f"Batch processing job '{job_id}' initiated for {len(files)} files, targeting PDF output.")
         return JSONResponse(
-            content={"job_id": job_id, "status": "processing_initiated", "message": "Your files are being processed in the background. Use the job_id to check status and download results."},
+            content={"job_id": job_id, "status": "processing_initiated", "message": "Your files are being processed in the background for PDF output. Use the job_id to check status and download results."},
             status_code=status.HTTP_202_ACCEPTED
         )
 
@@ -84,12 +85,83 @@ async def upload_resumes(
         # Re-raise HTTPException if it originated from content type check
         raise
     except Exception as e:
-        logger.error(f"Error during initial file upload or job creation: {e}", exc_info=True)
+        logger.error(f"Error during initial file upload or job creation for PDF output: {e}", exc_info=True)
         # Clean up temp directory if an error occurred before job was fully enqueued
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logger.info(f"Cleaned up temp directory {temp_dir} due to error.")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to initiate file processing: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to initiate file processing for PDF output: {e}")
+
+# --- NEW ENDPOINT FOR DOCX OUTPUT ---
+@router.post("/upload-resumes-to-docx", status_code=status.HTTP_202_ACCEPTED)
+async def upload_resumes_to_docx(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...)
+):
+    """
+    Handles multiple resume uploads for DOCX output. Files are saved temporarily, and processing
+    is delegated to a background task. Returns a job ID to poll for status.
+    All successful outputs will be a ZIP file containing DOCX files.
+    """
+    if not files:
+        logger.warning("No files provided in the /upload-resumes-to-docx request.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No files provided.")
+
+    allowed_content_types = {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", # .docx
+        "application/msword" # .doc
+    }
+
+    files_to_process: List[Tuple[str, str, str]] = [] # (temp_file_path, original_filename, content_type)
+    original_filenames: List[str] = []
+
+    # Create a temporary directory for this specific job
+    temp_dir = tempfile.mkdtemp(prefix="resume_upload_docx_") # Use a different prefix for clarity
+    logger.info(f"Created temporary upload directory for DOCX job: {temp_dir}")
+    
+    try:
+        for file in files:
+            if file.content_type not in allowed_content_types:
+                logger.warning(f"Unsupported file type '{file.content_type}' for '{file.filename}' in DOCX batch upload.")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, 
+                    detail=f"Unsupported file type: {file.content_type} for '{file.filename}'. Only PDF, DOCX, and DOC are accepted."
+                )
+            
+            original_filenames.append(file.filename)
+            # Store in the job's dedicated temporary directory
+            temp_file_path = os.path.join(temp_dir, file.filename) 
+            
+            # Use aiofiles to asynchronously write the file to temp storage
+            async with aiofiles.open(temp_file_path, 'wb') as out_file:
+                while content := await file.read(1024): # Read in chunks
+                    await out_file.write(content)
+            
+            files_to_process.append((temp_file_path, file.filename, file.content_type))
+            logger.info(f"File '{file.filename}' saved temporarily to '{temp_file_path}' for DOCX job.")
+
+        # Create a new job with the manager, specifying DOCX output
+        job_id = str(uuid.uuid4())
+        job_manager.create_job(job_id, original_filenames, temp_dir, target_format=OutputFormat.DOCX) 
+
+        # Schedule the processing as a background task
+        background_tasks.add_task(services.process_batch_of_resumes, job_id, files_to_process, temp_dir)
+        
+        logger.info(f"Batch processing job '{job_id}' initiated for {len(files)} files, targeting DOCX output.")
+        return JSONResponse(
+            content={"job_id": job_id, "status": "processing_initiated", "message": "Your files are being processed in the background for DOCX output. Use the job_id to check status and download results."},
+            status_code=status.HTTP_202_ACCEPTED
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during initial file upload or job creation for DOCX output: {e}", exc_info=True)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temp directory {temp_dir} due to error.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to initiate file processing for DOCX output: {e}")
 
 
 @router.get("/status/{job_id}")
@@ -102,7 +174,7 @@ async def get_job_status(job_id: str):
         logger.warning(f"Status requested for non-existent job ID: {job_id}")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
 
-    logger.info(f"Status requested for job '{job_id}'. Current status: {job.status.value}")
+    logger.info(f"Status requested for job '{job_id}'. Current status: {job.status.value}, Target format: {job.target_format.value}")
     
     response_content = {
         "job_id": job_id,
@@ -114,7 +186,7 @@ async def get_job_status(job_id: str):
     if job.status == JobStatus.FAILED:
         response_content["error_message"] = job.error_message
     elif job.status == JobStatus.COMPLETED:
-        response_content["message"] = "Processing completed successfully. Download the ZIP file using the /download/{job_id} endpoint."
+        response_content["message"] = f"Processing completed successfully. Download the ZIP file containing {job.target_format.value.upper()}s using the /download/{{job_id}} endpoint."
     
     return JSONResponse(content=response_content)
 
@@ -125,7 +197,8 @@ async def download_job_results(
     background_tasks: BackgroundTasks
 ):
     """
-    Downloads the processed results for a job as a ZIP file containing PDFs.
+    Downloads the processed results for a job as a ZIP file containing either PDFs or DOCX files,
+    depending on the job's target_format.
     """
     job_data = job_manager.get_job_status(job_id)
 
@@ -149,6 +222,10 @@ async def download_job_results(
             async with aiofiles.open(zip_file_path, mode="rb") as f:
                 while chunk := await f.read(8192): # Read in chunks
                     yield chunk
+
+        # Determine the filename for download based on the target_format
+        output_ext = "pdf" if job_data.target_format == OutputFormat.PDF else "docx"
+        download_filename = f"parsed_resumes_{job_id}_{output_ext}s.zip"
 
         # Define a cleanup task for the zip file and the temp upload directory after it has been sent
         async def cleanup_job_files_async():
@@ -178,7 +255,7 @@ async def download_job_results(
         return StreamingResponse(
             file_iterator(),
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=\"parsed_resumes_{job_id}_pdfs.zip\""}
+            headers={"Content-Disposition": f"attachment; filename=\"{download_filename}\""}
         )
 
     # Fallback if somehow completed but no zip_file_path (shouldn't happen with current logic)

@@ -19,10 +19,13 @@ import shutil # For removing directories
 
 # Import the configured LLM client and prompt from utils
 from .llm_config import azure_openai_client, AZURE_DEPLOYMENT_NAME, LLM_RESUME_PARSING_PROMPT
-from ...utils.job_manager import job_manager, JobStatus # Import job manager
+# Update import for OutputFormat
+from ...utils.job_manager import job_manager, JobStatus, OutputFormat 
 
 # Import your PDF generator
 from .generators.pdf_generator import generate_pdf_from_json
+# Import your DOCX generator
+from .generators.docx_generator import generate_docx_from_json 
 
 logger = logging.getLogger(__name__) # Get a logger instance for this module
 
@@ -165,7 +168,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
         return parsed_resume, usage_info
 
     except json.JSONDecodeError as e:
-        logger.error(f"LLM did not return valid JSON. Raw output: {llm_output_str if 'llm_output_str' in locals() else 'N/A'}. Error: {e}", exc_info=True)
+        logger.error(f"LLM did not return valid JSON. Raw output: {llm_output_str if 'llm_output_str' in locals() else 'N/A'}. Error: {e}. Resume text snippet: {resume_text[:500]}", exc_info=True)
         raise ValueError(f"LLM response error: {e}")
     except Exception as e:
         logger.error(f"Failed to call Azure OpenAI or process its response: {e}", exc_info=True)
@@ -367,6 +370,14 @@ async def process_batch_of_resumes(job_id: str, file_info_for_batch: List[Tuple[
     'file_info_for_batch' is a list of (temp_file_path, original_filename, content_type)
     'temp_dir' is the temporary directory where the uploaded files are stored.
     """
+    # Retrieve job data to get the target_format
+    job_data = job_manager.get_job_status(job_id)
+    if not job_data:
+        logger.error(f"Job '{job_id}' not found during batch processing initiation.")
+        return # Exit if job data is somehow missing
+
+    target_format = job_data.target_format # Get the desired output format
+
     # Ensure job status is set to PROCESSING
     job_manager.update_job_status(job_id, JobStatus.PROCESSING)
     results = [] # This list will store the Dict[str, Any] results for each file
@@ -428,57 +439,60 @@ async def process_batch_of_resumes(job_id: str, file_info_for_batch: List[Tuple[
                 progress = int((processed_count / total_files) * 100)
                 job_manager.update_job_status(job_id, JobStatus.PROCESSING, progress=progress)
 
-        # IMPORTANT: This block will now ALWAYS generate a ZIP file for completed jobs.
-        # This handles both single and multiple files consistently.
-        zip_file_name = f"parsed_resumes_{job_id}_pdfs.zip"
+        # Generate ZIP file based on target_format
+        output_ext = "pdf" if target_format == OutputFormat.PDF else "docx"
+        zip_file_name = f"parsed_resumes_{job_id}_{output_ext}s.zip"
         zip_file_path = os.path.join(DOWNLOAD_DIR, zip_file_name)
         
         try:
             with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for result_item in results:
-                    # Only add successfully parsed items to the ZIP as PDFs
+                    # Only add successfully parsed items to the ZIP
                     if result_item and result_item.get("parsed_data") and result_item.get("status") == "SUCCESS":
                         parsed_data = result_item["parsed_data"]
                         original_fname = result_item.get("original_filename", "unknown_file")
                         
                         extracted_name = parsed_data.get("basic_details", {}).get("name", "").strip()
                         
-                        # Determine base filename for PDF (e.g., "JOHN_DOE_RESUME.pdf")
+                        # Determine base filename for output (e.g., "JOHN_DOE_RESUME.pdf" or "JOHN_DOE_RESUME.docx")
                         if extracted_name and extracted_name != "N/A":
                             sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
-                            pdf_filename = f"{sanitized_name_upper}_RESUME.pdf"
+                            output_filename = f"{sanitized_name_upper}_RESUME.{output_ext}"
                         else:
                             # Fallback if name not found, use original filename parts
                             name_part = os.path.splitext(original_fname)[0]
                             sanitized_name_part = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_').upper()
-                            pdf_filename = f"PARSED_{sanitized_name_part}_RESUME.pdf"
+                            output_filename = f"PARSED_{sanitized_name_part}_RESUME.{output_ext}"
                         
-                        # Generate PDF bytes in a separate thread
+                        # Generate file bytes in a separate thread based on target_format
                         try:
-                            pdf_bytes = await asyncio.to_thread(generate_pdf_from_json, parsed_data)
+                            if target_format == OutputFormat.PDF:
+                                generated_bytes = await asyncio.to_thread(generate_pdf_from_json, parsed_data)
+                            else: # OutputFormat.DOCX
+                                generated_bytes = await asyncio.to_thread(generate_docx_from_json, parsed_data)
                             
                             # Handle potential duplicate filenames in zip to prevent overwrites
                             counter = 1
-                            final_pdf_filename = pdf_filename
-                            while final_pdf_filename in zf.namelist():
-                                base, ext = os.path.splitext(pdf_filename)
-                                final_pdf_filename = f"{base}_{counter}{ext}"
+                            final_output_filename = output_filename
+                            while final_output_filename in zf.namelist():
+                                base, ext = os.path.splitext(output_filename)
+                                final_output_filename = f"{base}_{counter}{ext}"
                                 counter += 1
 
-                            zf.writestr(final_pdf_filename, pdf_bytes)
-                            logger.info(f"Added '{final_pdf_filename}' to zip for job '{job_id}'.")
-                        except Exception as pdf_gen_e:
-                            logger.error(f"Failed to generate PDF for '{original_fname}' (Job '{job_id}'): {pdf_gen_e}", exc_info=True)
-                            # Add a placeholder text file to the zip indicating PDF generation failure
-                            zf.writestr(f"FAILED_PDF_{os.path.splitext(original_fname)[0]}.txt", 
-                                        f"PDF generation failed for '{original_fname}': {pdf_gen_e}")
+                            zf.writestr(final_output_filename, generated_bytes)
+                            logger.info(f"Added '{final_output_filename}' to zip for job '{job_id}'.")
+                        except Exception as gen_e:
+                            logger.error(f"Failed to generate {output_ext.upper()} for '{original_fname}' (Job '{job_id}'): {gen_e}", exc_info=True)
+                            # Add a placeholder text file to the zip indicating generation failure
+                            zf.writestr(f"FAILED_{output_ext.upper()}_{os.path.splitext(original_fname)[0]}.txt", 
+                                        f"{output_ext.upper()} generation failed for '{original_fname}': {gen_e}")
                     else:
                         # Add a text file indicating the failure to the zip for clarity if parsing failed
                         original_fname_for_log = result_item.get('original_filename', 'N/A') if result_item else 'N/A (result_item was None)'
                         error_msg_for_log = result_item.get('error_message', 'No specific error message') if result_item else 'N/A'
                         logger.warning(f"Skipping failed or invalid result for '{original_fname_for_log}' (Error: {error_msg_for_log}) when creating ZIP for job '{job_id}'.")
                         zf.writestr(f"FAILED_PARSE_{os.path.splitext(original_fname_for_log)[0]}.txt", 
-                                    f"Parsing failed for '{original_fname_for_log}': {error_msg_for_log}. No PDF generated.")
+                                    f"Parsing failed for '{original_fname_for_log}': {error_msg_for_log}. No {output_ext.upper()} generated.")
 
             job_manager.update_job_status(
                 job_id, 
