@@ -1,0 +1,26 @@
+# FastAPI and its ASGI server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# PDF processing and image manipulation
+PyMuPDF==1.23.25
+Pillow==10.3.0
+
+# OCR library and its dependencies
+easyocr==1.7.2
+
+# PyTorch (CPU-only)
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+
+# For numerical operations, used by EasyOCR internally and for image conversion
+numpy==1.26.4
+
+# Azure OpenAI SDK and its HTTP client dependency
+openai==1.33.0
+httpx==0.27.0
+
+# For processing .docx and .doc files (pure Python)
+python-docx==1.1.0
+pydocx==0.9.10 # Corrected to the latest available version
