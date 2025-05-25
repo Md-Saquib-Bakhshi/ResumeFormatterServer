@@ -6,7 +6,6 @@ import re
 import os
 import logging
 import zipfile
-# Removed 'import tempfile' as we are no longer using mkstemp directly for the final ZIP
 from typing import List, Dict, Any, Tuple
 
 from PIL import Image
@@ -21,24 +20,20 @@ import aiofiles # For async file I/O
 from .llm_config import azure_openai_client, AZURE_DEPLOYMENT_NAME, LLM_RESUME_PARSING_PROMPT
 from ...utils.job_manager import job_manager, JobStatus # Import job manager
 
+# Import your PDF generator
+from .generators.pdf_generator import generate_pdf_from_json
+
 logger = logging.getLogger(__name__) # Get a logger instance for this module
 
 # Initialize EasyOCR reader once globally for performance.
 # This assumes EasyOCR and its dependencies are correctly installed.
-# You might need to specify model_storage_directory if models are not auto-downloaded.
 reader = easyocr.Reader(['en'], gpu=False) # Set gpu=False if you don't have CUDA/GPU setup
 
 # Initialize a global thread pool for running synchronous OCR and LLM calls.
-# The number of workers can be tuned based on your server's core count and expected load.
 ocr_llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 # --- Define your project's download directory ---
 # This path assumes your 'downloads' folder is at the 'src/server' level.
-# E.g., ResumeFormatter/src/server/downloads/
-# os.path.dirname(__file__) is '.../src/server/app/api/resume'
-# '..' goes to '.../src/server/app/api'
-# '..' goes to '.../src/server/app'
-# '..' goes to '.../src/server' (This is your PROJECT_ROOT for saving files)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 DOWNLOAD_DIR = os.path.join(PROJECT_ROOT, 'downloads')
 
@@ -431,46 +426,59 @@ async def process_batch_of_resumes(job_id: str, file_paths_and_types: List[Tuple
 
         # Generate ZIP file if there's more than one result or if explicitly for batch
         if total_files > 1:
-            zip_file_name = f"parsed_resumes_{job_id}.zip"
+            zip_file_name = f"parsed_resumes_{job_id}_pdfs.zip" # Changed zip filename
             # Define the full path for the ZIP file in your designated DOWNLOAD_DIR
             zip_file_path = os.path.join(DOWNLOAD_DIR, zip_file_name)
             
             try:
                 with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for result_item in results:
-                        # CRITICAL FIX: Ensure result_item is not None and has 'parsed_data'
-                        if result_item and result_item.get("parsed_data") and result_item.get("status") != "FAILED":
+                        # CRITICAL FIX: Ensure result_item is not None and has 'parsed_data' and is SUCCESS
+                        if result_item and result_item.get("parsed_data") and result_item.get("status") == "SUCCESS":
                             parsed_data = result_item["parsed_data"] # Access directly now that we've checked existence
                             original_fname = result_item.get("original_filename", "unknown_file")
                             
-                            # Generate unique filename for JSON inside zip
                             extracted_name = parsed_data.get("basic_details", {}).get("name", "").strip()
+                            
+                            # Determine base filename for PDF (e.g., "JOHN_DOE_RESUME.pdf")
                             if extracted_name and extracted_name != "N/A":
                                 sanitized_name_upper = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_').upper()
-                                json_filename = f"{sanitized_name_upper}_RESUME.json"
+                                pdf_filename = f"{sanitized_name_upper}_RESUME.pdf"
                             else:
                                 # Fallback if name not found, use original filename parts
                                 name_part = os.path.splitext(original_fname)[0]
                                 sanitized_name_part = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_').upper()
-                                json_filename = f"PARSED_{sanitized_name_part}_RESUME.json"
+                                pdf_filename = f"PARSED_{sanitized_name_part}_RESUME.pdf"
                             
-                            # Handle potential duplicate filenames in zip to prevent overwrites
-                            counter = 1
-                            final_json_filename = json_filename
-                            while final_json_filename in zf.namelist():
-                                base, ext = os.path.splitext(json_filename)
-                                final_json_filename = f"{base}_{counter}{ext}"
-                                counter += 1
+                            # Generate PDF bytes
+                            try:
+                                # Run synchronous PDF generation in a separate thread
+                                pdf_bytes = await asyncio.to_thread(generate_pdf_from_json, parsed_data)
+                                
+                                # Handle potential duplicate filenames in zip to prevent overwrites
+                                counter = 1
+                                final_pdf_filename = pdf_filename
+                                while final_pdf_filename in zf.namelist():
+                                    base, ext = os.path.splitext(pdf_filename)
+                                    final_pdf_filename = f"{base}_{counter}{ext}"
+                                    counter += 1
 
-                            json_content = json.dumps(parsed_data, indent=2, ensure_ascii=False)
-                            zf.writestr(final_json_filename, json_content)
-                            logger.info(f"Added '{final_json_filename}' to zip for job '{job_id}'.")
+                                zf.writestr(final_pdf_filename, pdf_bytes)
+                                logger.info(f"Added '{final_pdf_filename}' to zip for job '{job_id}'.")
+                            except Exception as pdf_gen_e:
+                                logger.error(f"Failed to generate PDF for '{original_fname}' (Job '{job_id}'): {pdf_gen_e}", exc_info=True)
+                                # Optionally, add a placeholder text file to the zip indicating failure
+                                zf.writestr(f"FAILED_PDF_{os.path.splitext(original_fname)[0]}.txt", 
+                                            f"PDF generation failed for '{original_fname}': {pdf_gen_e}")
                         else:
                             # Log that a file's result was not valid for zipping (e.g., it failed parsing)
                             original_fname_for_log = result_item.get('original_filename', 'N/A') if result_item else 'N/A (result_item was None)'
                             error_msg_for_log = result_item.get('error_message', 'No specific error message') if result_item else 'N/A'
                             logger.warning(f"Skipping failed or invalid result for '{original_fname_for_log}' (Error: {error_msg_for_log}) when creating ZIP for job '{job_id}'.")
-                
+                            # Add a text file indicating the failure to the zip for clarity
+                            zf.writestr(f"FAILED_PARSE_{os.path.splitext(original_fname_for_log)[0]}.txt", 
+                                        f"Parsing failed for '{original_fname_for_log}': {error_msg_for_log}. No PDF generated.")
+
                 # Update job manager with the path to the newly created ZIP file
                 job_manager.update_job_status(job_id, JobStatus.COMPLETED, results=results, zip_file_path=zip_file_path, progress=100)
                 logger.info(f"Job '{job_id}' completed. ZIP file created at: {zip_file_path}")
@@ -484,8 +492,9 @@ async def process_batch_of_resumes(job_id: str, file_paths_and_types: List[Tuple
 
         # If it's a single file, update status directly without ZIP
         elif total_files == 1:
-            # Ensure the results list is not empty and the first item is valid
-            if results and results[0] and results[0].get("parsed_data"):
+            # For a single file, the download route will handle PDF/DOCX/JSON generation on demand.
+            # No need to pre-generate PDF here, just mark as completed if processing was successful.
+            if results and results[0] and results[0].get("parsed_data") and results[0].get("status") == "SUCCESS":
                 job_manager.update_job_status(job_id, JobStatus.COMPLETED, results=results, progress=100)
                 logger.info(f"Job '{job_id}' completed with single file result.")
             else:
