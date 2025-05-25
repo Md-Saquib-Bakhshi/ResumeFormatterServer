@@ -3,6 +3,8 @@ import json
 import asyncio
 import concurrent.futures
 import re
+import os
+import logging
 
 from PIL import Image
 import numpy as np
@@ -13,6 +15,8 @@ from pydocx import PyDocX # For .doc files
 
 # Import the configured LLM client and prompt from utils
 from .llm_config import azure_openai_client, AZURE_DEPLOYMENT_NAME, LLM_RESUME_PARSING_PROMPT
+
+logger = logging.getLogger(__name__) # Get a logger instance for this module
 
 # Initialize EasyOCR reader once globally for performance.
 reader = easyocr.Reader(['en'])
@@ -27,6 +31,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
     """
     # Check if LLM client was successfully initialized
     if azure_openai_client is None:
+        logger.error("Azure OpenAI client is not initialized. Cannot perform LLM call.")
         raise RuntimeError("Azure OpenAI client is not initialized. Please set up API credentials.")
 
     loop = asyncio.get_event_loop()
@@ -48,6 +53,17 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
             )
         )
         
+        # --- Token Usage Tracking ---
+        if response.usage:
+            logger.info(
+                f"LLM Token Usage: Prompt Tokens={response.usage.prompt_tokens}, "
+                f"Completion Tokens={response.usage.completion_tokens}, "
+                f"Total Tokens={response.usage.total_tokens}"
+            )
+        else:
+            logger.warning("LLM response did not contain usage information.")
+        # --- End Token Usage Tracking ---
+
         llm_output_str = response.choices[0].message.content
         llm_data = json.loads(llm_output_str)
         
@@ -124,7 +140,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
         return parsed_resume
 
     except json.JSONDecodeError as e:
-        print(f"ERROR: LLM did not return valid JSON: {llm_output_str if 'llm_output_str' in locals() else 'N/A'} - {e}")
+        logger.error(f"LLM did not return valid JSON. Raw output: {llm_output_str if 'llm_output_str' in locals() else 'N/A'}. Error: {e}", exc_info=True)
         return {
             "basic_details": {"name": "N/A", "email": "N/A", "phone": "N/A", "links": {}},
             "technical_expertise": [],
@@ -133,7 +149,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> dict:
             "professional_experience": []
         }
     except Exception as e:
-        print(f"ERROR: Failed to call Azure OpenAI or process its response: {e}")
+        logger.error(f"Failed to call Azure OpenAI or process its response: {e}", exc_info=True)
         return {
             "basic_details": {"name": "N/A", "email": "N/A", "phone": "N/A", "links": {}},
             "technical_expertise": [],
@@ -153,14 +169,13 @@ def _extract_text_from_docx(doc_bytes: bytes) -> str:
         document = Document(io.BytesIO(doc_bytes))
         for para in document.paragraphs:
             text_content.append(para.text)
-        # Also iterate through tables
         for table in document.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for paragraph in cell.paragraphs:
                         text_content.append(paragraph.text)
     except Exception as e:
-        print(f"ERROR: Failed to extract text from DOCX: {e}")
+        logger.error(f"Failed to extract text from DOCX: {e}", exc_info=True)
         raise ValueError(f"Could not read DOCX file: {e}")
     return "\n".join(text_content)
 
@@ -171,7 +186,7 @@ def _extract_text_from_doc(doc_bytes: bytes) -> str:
     Note: This converts .doc to HTML internally and then extracts text.
     It does not preserve layout or extract text from images within the doc.
     """
-    text_content = "" # Initialize as empty string
+    text_content = ""
     try:
         html_content = PyDocX.to_html(io.BytesIO(doc_bytes))
         
@@ -179,7 +194,7 @@ def _extract_text_from_doc(doc_bytes: bytes) -> str:
         text_content = re.sub(cleanr, '', html_content)
         
     except Exception as e:
-        print(f"ERROR: Failed to extract text from DOC: {e}")
+        logger.error(f"Failed to extract text from DOC: {e}", exc_info=True)
         raise ValueError(f"Could not read DOC file: {e}")
     return text_content
 
@@ -195,9 +210,8 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
     """
     all_extracted_text_segments = []
 
-    # Determine processing path based on content type
     if content_type == "application/pdf":
-        print(f"Processing {original_filename} as PDF...")
+        logger.info(f"Processing '{original_filename}' as PDF.")
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         loop = asyncio.get_event_loop()
         ocr_tasks = []
@@ -210,7 +224,6 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                 all_extracted_text_segments.append(f"--- Page {page_num + 1} (PDF Text Layer) ---\n")
                 all_extracted_text_segments.append(text_from_pdf_layer)
             
-            # Conditional Full-Page OCR Logic
             perform_full_page_ocr = False
             native_text_len = len(text_from_pdf_layer.strip())
 
@@ -221,7 +234,6 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                 if not any(keyword in text_from_pdf_layer.lower() for keyword in common_section_keywords):
                     perform_full_page_ocr = True 
 
-            # Embedded Image OCR
             image_list = page.get_images(full=True)
             for img_index, img_info in enumerate(image_list):
                 xref = img_info[0]
@@ -230,7 +242,7 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                 img_ext = base_image.get("ext")
 
                 if not img_bytes:
-                    print(f"WARNING: No image bytes extracted for embedded image {img_index} on page {page_num}.")
+                    logger.warning(f"No image bytes extracted for embedded image {img_index} on page {page_num} of '{original_filename}'.")
                     continue
 
                 if img_ext.lower() in ["png", "jpeg", "jpg", "gif", "bmp"]:
@@ -246,18 +258,17 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                         ocr_tasks.append(ocr_task_future)
                         all_extracted_text_segments.append(f"--- Page {page_num + 1}, Embedded Image {img_index + 1} (OCR Scheduled) ---\n")
                     except Exception as img_e:
-                        print(f"ERROR: Failed to prepare embedded image {img_index} on page {page_num} for OCR: {img_e}")
+                        logger.error(f"Failed to prepare embedded image {img_index} on page {page_num} of '{original_filename}' for OCR: {img_e}", exc_info=True)
                 else:
-                    print(f"WARNING: Skipping unsupported embedded image format '{img_ext}' on page {page_num}, image {img_index}.")
+                    logger.warning(f"Skipping unsupported embedded image format '{img_ext}' on page {page_num}, image {img_index} of '{original_filename}'.")
 
-            # Full Page OCR (Conditional)
             if perform_full_page_ocr:
                 try:
                     pix = page.get_pixmap(matrix=fitz.Matrix(1, 1))
                     img_bytes_from_page = pix.tobytes("png")
 
                     if not img_bytes_from_page:
-                        print(f"WARNING: No bytes generated when rendering page {page_num} for full page OCR.")
+                        logger.warning(f"No bytes generated when rendering page {page_num} for full page OCR of '{original_filename}'.")
                         continue
 
                     image_from_page = Image.open(io.BytesIO(img_bytes_from_page))
@@ -271,19 +282,19 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                     ocr_tasks.append(ocr_task_future)
                     all_extracted_text_segments.append(f"--- Page {page_num + 1} (Full Page OCR Scheduled) ---\n")
                 except Exception as e_page_ocr:
-                    print(f"ERROR: Could not render or prepare page {page_num} for full page OCR: {e_page_ocr}")
+                    logger.error(f"Could not render or prepare page {page_num} of '{original_filename}' for full page OCR: {e_page_ocr}", exc_info=True)
             else:
-                print(f"DEBUG: Skipping full page OCR for page {page_num} based on content heuristics.")
+                logger.debug(f"Skipping full page OCR for page {page_num} of '{original_filename}' based on content heuristics.")
 
-        doc.close() # Close the PDF document after processing all pages.
+        doc.close()
 
-        print("Waiting for all OCR tasks to complete...")
+        logger.info(f"Waiting for all OCR tasks for '{original_filename}' to complete...")
         completed_ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
-        print("All OCR tasks completed.")
+        logger.info(f"All OCR tasks for '{original_filename}' completed.")
 
         for res in completed_ocr_results:
             if isinstance(res, Exception):
-                print(f"ERROR: An OCR task failed: {res}")
+                logger.error(f"An OCR task failed for '{original_filename}': {res}", exc_info=True)
             else:
                 extracted_text_from_ocr = [text for (bbox, text, prob) in res]
                 if extracted_text_from_ocr:
@@ -291,30 +302,41 @@ async def process_resume_document(file_bytes: bytes, original_filename: str, con
                     all_extracted_text_segments.append(combined_ocr_text_segment)
 
     elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        print(f"Processing {original_filename} as DOCX (direct text extraction)...")
-        all_extracted_text_segments.append(_extract_text_from_docx(file_bytes))
-        print("Text extracted from DOCX.")
-
+        logger.info(f"Processing '{original_filename}' as DOCX (direct text extraction).")
+        try:
+            all_extracted_text_segments.append(_extract_text_from_docx(file_bytes))
+            logger.info(f"Text extracted from DOCX '{original_filename}'.")
+        except ValueError as e:
+            logger.error(f"Failed to extract text from DOCX '{original_filename}': {e}", exc_info=True)
+            raise # Re-raise to be caught by the router
+        
     elif content_type == "application/msword":
-        print(f"Processing {original_filename} as DOC (direct text extraction)...")
-        all_extracted_text_segments.append(_extract_text_from_doc(file_bytes))
-        print("Text extracted from DOC.")
+        logger.info(f"Processing '{original_filename}' as DOC (direct text extraction).")
+        try:
+            all_extracted_text_segments.append(_extract_text_from_doc(file_bytes))
+            logger.info(f"Text extracted from DOC '{original_filename}'.")
+        except ValueError as e:
+            logger.error(f"Failed to extract text from DOC '{original_filename}': {e}", exc_info=True)
+            raise # Re-raise to be caught by the router
 
     else:
+        logger.error(f"Unsupported content type '{content_type}' for '{original_filename}'.")
         raise ValueError(f"Unsupported content type for processing: {content_type}")
 
     full_resume_text = "\n".join(all_extracted_text_segments)
 
-    print("Calling LLM for full resume parsing...")
+    logger.info(f"Calling LLM for full resume parsing for '{original_filename}'...")
     parsed_resume_data = await _call_llm_for_resume_parsing(full_resume_text)
-    print(f"LLM parsed data: {json.dumps(parsed_resume_data, indent=2)}")
+    logger.info(f"LLM parsing completed for '{original_filename}'.")
 
     extracted_name = parsed_resume_data.get("basic_details", {}).get("name", "").strip()
     if extracted_name and extracted_name != "N/A":
         sanitized_name = re.sub(r'[^\w\s-]', '', extracted_name).strip().replace(' ', '_')
         output_filename = f"{sanitized_name}_resume.json"
+        logger.info(f"Generated output filename: '{output_filename}' based on extracted name.")
     else:
         output_filename = f"parsed_resume.json"
+        logger.warning(f"Could not extract name from resume '{original_filename}'. Defaulting output filename to '{output_filename}'.")
 
     return {
         "filename": output_filename,

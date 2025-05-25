@@ -1,6 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.resume.routes import router as resume_router
+import logging
+from .utils.logging_config import setup_logging # Import the logging setup function
+
+# Set up logging as the very first step
+setup_logging()
+logger = logging.getLogger(__name__) # Get a logger instance for this module
 
 app = FastAPI()
 
@@ -18,4 +24,4 @@ app.include_router(resume_router, prefix="/resume", tags=["resume"])
 
 @app.on_event("startup")
 def on_startup():
-    print("🚀 Server is running... Visit http://localhost:8000/docs")
+    logger.info("🚀 Server is running... Visit http://localhost:8000/docs")

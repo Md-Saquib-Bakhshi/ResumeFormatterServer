@@ -1,5 +1,8 @@
 import os
+import logging
 from openai import AzureOpenAI
+
+logger = logging.getLogger(__name__) # Get a logger instance for this module
 
 # --- Azure OpenAI Configuration ---
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -16,12 +19,12 @@ if all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_DEPLOYMENT_NAME, AZUR
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_version=AZURE_OPENAI_API_VERSION
         )
-        print("INFO: Azure OpenAI client initialized successfully.")
+        logger.info("Azure OpenAI client initialized successfully.")
     except Exception as e:
-        print(f"ERROR: Failed to initialize Azure OpenAI client: {e}")
+        logger.error(f"Failed to initialize Azure OpenAI client: {e}", exc_info=True)
         azure_openai_client = None
 else:
-    print("WARNING: Azure OpenAI environment variables are not fully set. LLM functionality will be disabled.")
+    logger.warning("Azure OpenAI environment variables are not fully set. LLM functionality will be disabled.")
 
 
 # Define the LLM prompt here.
