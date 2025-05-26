@@ -7,8 +7,8 @@ logger = logging.getLogger(__name__) # Get a logger instance for this module
 # --- Azure OpenAI Configuration ---
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o") # Default to gpt-4o
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01") # Use a stable API version
 
 # Initialize azure_openai_client. It will be None if credentials are not fully set.
 azure_openai_client = None
@@ -28,50 +28,79 @@ else:
 
 
 # Define the LLM prompt here.
-LLM_RESUME_PARSING_PROMPT = """You are a Resume Data Extractor. When given a raw resume (plain text, PDF-OCR, or DOCX), you must output **only** a JSON object with the following schema:
+LLM_RESUME_PARSING_PROMPT = """
+You are an advanced AI assistant specializing in extracting structured resume data.
+Your task is to parse the provided resume text and output a JSON object strictly following the given schema.
 
-{
-  "basic_details": {
+**Key Instructions for Extraction:**
+1.  **Strict JSON Schema Adherence**: Your output MUST be a valid JSON object matching the `OutputFormat` schema provided below. Do not include any additional text or formatting outside the JSON.
+2.  **Accuracy and Completeness**: Extract all relevant information accurately from the resume. If a field is not explicitly found, use "N/A" for string fields, an empty array `[]` for list fields, and empty objects `{}` for object fields (e.g., `links`).
+3.  **Specific Field Guidelines**:
+    * **`professional_summary`**: Extract 3–5 concise, high-level statements that describe the candidate's overall career focus, experience length, and general expertise. These should be truly summary-level, without deep technical details or specific achievements. Each statement should be a distinct bullet point in the array.
+    * **`technical_expertise`**: This MUST be an object (dictionary) where keys are broad technical categories (e.g., "Technologies", "Frameworks", "Database Management Systems", "Scripting Languages", "Version Control & CI/CD", "Platforms", "AI", "Solution Architecture"). Each value associated with a category key MUST be an array (list) of individual technical skills or tools belonging to that category. Compile ALL relevant technical skills found anywhere in the resume (dedicated sections, summary, experience descriptions). Avoid redundancy; only include unique skills within each category. If a category is empty, its value should be an empty array `[]`.
+    * **`certifications`**: Extract certification titles and dates. If only the title is available, set the date to "N/A". If additional certifications or related content (such as course completions, credentials, or badges) are found in images or headers/footers via OCR, include them here as well. Clearly list such OCR-captured data under this section, respecting the same format: `{ "title": "...", "date": "..." }`. If a date is not available in OCR data, set it to "N/A".
+    * **`education`**: Extract all educational qualifications as a list of objects. Each object should include the "degree", "institution", and "date_range". If exact fields are missing, set them to "N/A".
+    * **`professional_experience.responsibilities`**: Each element in this array should be a separate, action-oriented bullet point describing a specific achievement or duty related to that role. Do not combine multiple distinct responsibilities into one bullet.
+4.  **Date Ranges**: Extract date ranges for education and experience accurately (e.g., "Sept 2020 - Present", "2018 - 2022").
+5.  **Links**: For `basic_details.links`, use common keys like "linkedin", "github", "portfolio", "website", etc.
+6.  **Case Sensitivity**: Maintain the original case for names, companies, roles, and certifications.
+7.  **Address/Location**: Do NOT extract street addresses. Only extract city, state, or country if explicitly mentioned and part of the basic details, but do not include it in the current schema. Focus on the provided schema.
+
+**OutputFormat (JSON Schema):**
+```json
+{{
+  "basic_details": {{
     "name": "string",
     "email": "string",
     "phone": "string",
-    "links": {
+    "links": {{
+      "linkedin": "string",
       "github": "string",
-      "linkedin": "string"
-      // any other personal URLs; if none, omit or set to "N/A"
-    }
-  },
-  "technical_expertise": [
+      "portfolio": "string",
+      "website": "string"
+      // ... other relevant links
+    }}
+  }},
+  "professional_summary": [
     "string"
-    // e.g. ".NET Core", "React", "Azure"; gather all listed skills
   ],
+  "technical_expertise": {{
+    "Solution Architecture": ["string"],
+    "Technologies": ["string"],
+    "Frameworks": ["string"],
+    "Design Patterns/Architecture": ["string"],
+    "Database Management Systems": ["string"],
+    "Scripting Languages": ["string"],
+    "Style Sheets/Frameworks": ["string"],
+    "Version Control & CI/CD": ["string"],
+    "Platforms": ["string"],
+    "AI": ["string"]
+    // ... add more categories if needed based on common resume sections
+  }},
   "certifications": [
-    {
+    {{
       "title": "string",
-      "date": "string" // if no date is given, set to "N/A"
-    }
+      "date": "string"
+    }}
   ],
-  "professional_summary": "string", // A concise, high-level overview or narrative paragraph(s) of the candidate's career, key qualifications, and objectives. This may also be presented as high-level bullet points summarizing their overall profile. Look for sections like "Summary", "Professional Summary", "Profile", "About Me", etc. This field should NOT contain granular technical skills (which belong in 'technical_expertise') nor detailed job responsibilities (which belong in 'professional_experience'). If absent, "N/A".
+  "education": [
+    {{
+      "degree": "string",
+      "institution": "string",
+      "date_range": "string"
+    }}
+  ],
   "professional_experience": [
-    {
+    {{
       "company": "string",
-      "date_range": "string", // e.g. "Oct 2021 – Dec 2024"; if unclear, "N/A"
       "role": "string",
-      "client_engagement": "string", // the client or project name; if none, "N/A"
-      "program": "string", // program or module name; if none, "N/A"
+      "date_range": "string",
+      "client_engagement": "string",
+      "program": "string",
       "responsibilities": [
-        "string" // each bullet or sentence as one element
+        "string"
       ]
-    }
+    }}
   ]
-}
-
-**Rules:**
-1. **Field defaults:** If any field cannot be found, set its value to the string `"N/A"`.
-2. **Technical expertise:** Normalize to an array of individual technologies/frameworks/tools.
-3. **Certifications:** Extract title and date if possible; otherwise date → `"N/A"`.
-4. **Sort** the `professional_experience` array in **descending** order of the number of responsibilities (i.e. experiences with more responsibilities come first).
-5. **Strict JSON only:** Do not output any explanatory text or markdown—just the JSON.
-6. **Professional Summary:** Extract the overarching summary/profile section(s). This may be titled "Summary", "Professional Summary", "Profile", "About Me", etc. It should be a high-level narrative or key bullet points about the candidate's career and objectives. If multiple such sections are present, combine them into a single string. Do not include granular technical skills (for 'technical_expertise') or specific job duties (for 'professional_experience') in this field.
-
+}}
 """

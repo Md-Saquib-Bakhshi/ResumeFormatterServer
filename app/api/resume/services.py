@@ -74,7 +74,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                 messages=prompt_messages,
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=2500
+                max_tokens=5000
             )
         )
         
@@ -164,6 +164,9 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
             key=lambda x: len(x.get("responsibilities", [])), 
             reverse=True
         )
+
+        # Log the parsed JSON data
+        logger.info(f"Parsed JSON output from LLM: {json.dumps(parsed_resume, indent=2)}")
         
         return parsed_resume, usage_info
 
@@ -241,7 +244,7 @@ async def process_single_resume_file(
                 perform_full_page_ocr = True
             else:
                 # Check for common sections if there's some text but might be incomplete
-                common_section_keywords = ["experience", "education", "skills", "certifications", "summary", "projects", "awards", "licenses"]
+                common_section_keywords = ["experience", "education", "skills", "certifications", "summary", "projects", "awards", "licenses", "certified"]
                 if not any(keyword in text_from_pdf_layer.lower() for keyword in common_section_keywords):
                     perform_full_page_ocr = True 
 
