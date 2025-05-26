@@ -96,9 +96,10 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                 "name": "N/A", "email": "N/A", "phone": "N/A",
                 "links": {}
             },
-            "technical_expertise": [],
+            "professional_summary": ["N/A"], # Initialize with default
+            "technical_expertise": [], # Initialize as empty list of categories
             "certifications": [],
-            "professional_summary": "N/A",
+            "education": [],
             "professional_experience": []
         }
 
@@ -112,11 +113,37 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                     if link_val and str(link_val).strip() != "N/A":
                         parsed_resume["basic_details"]["links"][link_key.lower()] = str(link_val).strip()
 
+        # Safely populate professional_summary
+        if "professional_summary" in llm_data:
+            summary_content = llm_data["professional_summary"]
+            if isinstance(summary_content, list) and summary_content:
+                # Filter out empty or "N/A" strings from the list
+                cleaned_summary = [s.strip() for s in summary_content if s and s.strip() != "N/A"]
+                if cleaned_summary:
+                    parsed_resume["professional_summary"] = cleaned_summary
+                # If cleaned_summary is empty, it remains ["N/A"] as initialized
+            elif isinstance(summary_content, str) and summary_content.strip() and summary_content.strip() != "N/A":
+                # If it's a single string, convert to a list with one element
+                parsed_resume["professional_summary"] = [summary_content.strip()]
+            # Else, it remains ["N/A"] as initialized if content is invalid or "N/A"
+
         # Safely populate technical_expertise
         if "technical_expertise" in llm_data and isinstance(llm_data["technical_expertise"], list):
-            parsed_resume["technical_expertise"] = sorted(list(set([
-                str(s).strip() for s in llm_data["technical_expertise"] if str(s).strip() and str(s).strip() != "N/A"
-            ])))
+            for tech_category_item in llm_data["technical_expertise"]:
+                if isinstance(tech_category_item, dict):
+                    category_name = tech_category_item.get("category", "N/A").strip()
+                    skills_list = tech_category_item.get("skills", [])
+                    
+                    if category_name and category_name != "N/A": # Only add if category name is valid
+                        cleaned_skills = sorted(list(set([ # Ensure unique and cleaned skills
+                            str(s).strip() for s in skills_list if str(s).strip() and str(s).strip() != "N/A"
+                        ])))
+                        parsed_resume["technical_expertise"].append({
+                            "category": category_name,
+                            "skills": cleaned_skills
+                        })
+            # Optionally sort categories by category name for consistent output
+            parsed_resume["technical_expertise"] = sorted(parsed_resume["technical_expertise"], key=lambda x: x["category"].lower())
 
         # Safely populate certifications
         if "certifications" in llm_data and isinstance(llm_data["certifications"], list):
@@ -137,10 +164,21 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                     seen_titles.add(cert["title"].lower())
             parsed_resume["certifications"] = sorted(unique_certs, key=lambda x: x["title"].lower())
 
-        # Safely populate professional_summary
-        if "professional_summary" in llm_data:
-            parsed_resume["professional_summary"] = str(llm_data["professional_summary"]).strip() or "N/A"
-        
+        # Safely populate education (assuming it's a list of dicts like certifications)
+        if "education" in llm_data and isinstance(llm_data["education"], list):
+            edu_list = []
+            for edu_item in llm_data["education"]:
+                if isinstance(edu_item, dict):
+                    degree = edu_item.get("degree", "N/A")
+                    institution = edu_item.get("institution", "N/A")
+                    date_range = edu_item.get("date_range", "N/A")
+                    edu_list.append({
+                        "degree": str(degree).strip(),
+                        "institution": str(institution).strip(),
+                        "date_range": str(date_range).strip()
+                    })
+            parsed_resume["education"] = edu_list # No specific sorting requested, maintain order from LLM
+
         # Safely populate professional_experience
         experiences = []
         if "professional_experience" in llm_data and isinstance(llm_data["professional_experience"], list):
@@ -148,7 +186,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                 if isinstance(exp, dict):
                     responsibilities = exp.get("responsibilities", [])
                     if isinstance(responsibilities, str):
-                        responsibilities = [responsibilities]
+                        responsibilities = [responsibilities] # Ensure it's a list
                     
                     experiences.append({
                         "company": exp.get("company", "N/A"),
@@ -156,7 +194,7 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
                         "role": exp.get("role", "N/A"),
                         "client_engagement": exp.get("client_engagement", "N/A"),
                         "program": exp.get("program", "N/A"),
-                        "responsibilities": [str(r).strip() for r in responsibilities if str(r).strip() != "N/A"]
+                        "responsibilities": [str(r).strip() for r in responsibilities if str(r).strip() and str(r).strip() != "N/A"]
                     })
         
         parsed_resume["professional_experience"] = sorted(
@@ -343,7 +381,7 @@ async def process_single_resume_file(
                 "basic_details": {"name": "N/A", "email": "N/A", "phone": "N/A", "links": {}},
                 "technical_expertise": [],
                 "certifications": [],
-                "professional_summary": "N/A (No text extracted)",
+                "professional_summary": ["N/A"], # Updated default
                 "professional_experience": []
             },
             "llm_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -505,7 +543,7 @@ async def process_batch_of_resumes(job_id: str, file_info_for_batch: List[Tuple[
                 progress=100
             )
             logger.info(f"Job '{job_id}' completed. ZIP file created at: {zip_file_path}")
-        
+            
         except Exception as zip_e:
             logger.error(f"Job '{job_id}': Failed to create ZIP file: {zip_e}", exc_info=True)
             job_manager.update_job_status(
@@ -529,6 +567,5 @@ async def process_batch_of_resumes(job_id: str, file_info_for_batch: List[Tuple[
         if os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
-                logger.info(f"Job '{job_id}': Cleaned up temporary upload directory: {temp_dir}")
             except OSError as e:
                 logger.error(f"Job '{job_id}': Error removing temporary directory {temp_dir}: {e}")
