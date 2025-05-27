@@ -28,5 +28,7 @@ pydocx==0.9.10
 
 aiofiles==23.2.1 # NEW: For asynchronous file I/O
 
+aspose-words==24.5.0
+
 # For generating PDF files (pure Python)
 reportlab==4.0.0

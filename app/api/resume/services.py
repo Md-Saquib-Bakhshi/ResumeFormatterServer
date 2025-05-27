@@ -12,10 +12,14 @@ from PIL import Image
 import numpy as np
 import fitz # PyMuPDF
 import easyocr
-from docx import Document # For .docx files
-from pydocx import PyDocX # For .doc files
+# Removed: from docx import Document # No longer used for input text extraction
+# Removed: from pydocx import PyDocX # No longer used for input text extraction
 import aiofiles # For async file I/O
 import shutil # For removing directories
+
+# Import Aspose.Words for Word to PDF conversion
+from aspose.words import Document as AsposeDocument
+from aspose.words.saving import PdfSaveOptions
 
 # Import the configured LLM client and prompt from utils
 from .llm_config import azure_openai_client, AZURE_DEPLOYMENT_NAME, LLM_RESUME_PARSING_PROMPT
@@ -24,7 +28,7 @@ from ...utils.job_manager import job_manager, JobStatus, OutputFormat
 
 # Import your PDF generator
 from .generators.pdf_generator import generate_pdf_from_json
-# Import your DOCX generator
+# Import your DOCX generator (still needed for output generation)
 from .generators.docx_generator import generate_docx_from_json 
 
 logger = logging.getLogger(__name__) # Get a logger instance for this module
@@ -32,8 +36,8 @@ logger = logging.getLogger(__name__) # Get a logger instance for this module
 # Initialize EasyOCR reader once globally for performance.
 reader = easyocr.Reader(['en'], gpu=False) # Set gpu=False if you don't have CUDA/GPU setup
 
-# Initialize a global thread pool for running synchronous OCR and LLM calls.
-# Increased max_workers to potentially handle more concurrent OCR/LLM calls.
+# Initialize a global thread pool for running synchronous OCR, LLM, and Aspose calls.
+# Increased max_workers to potentially handle more concurrent synchronous calls.
 ocr_llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 # --- Define your project's download directory ---
@@ -215,40 +219,126 @@ async def _call_llm_for_resume_parsing(resume_text: str) -> Tuple[Dict[str, Any]
         logger.error(f"Failed to call Azure OpenAI or process its response: {e}", exc_info=True)
         raise ValueError(f"LLM call error: {e}")
 
-
-def _extract_text_from_docx(doc_bytes: bytes) -> str:
+# --- Aspose.Words Conversion Function ---
+def _convert_word_to_pdf_sync(word_bytes: bytes) -> bytes:
     """
-    Synchronously extracts plain text from a .docx file using python-docx.
+    Synchronously converts Word document bytes (.doc or .docx) to PDF bytes using Aspose.Words.
+    This function should be run in a thread pool executor.
     """
-    text_content = []
     try:
-        document = Document(io.BytesIO(doc_bytes))
-        for para in document.paragraphs:
-            text_content.append(para.text)
-        for table in document.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        text_content.append(paragraph.text)
-    except Exception as e:
-        logger.error(f"Failed to extract text from DOCX: {e}", exc_info=True)
-        raise ValueError(f"Could not read DOCX file: {e}")
-    return "\n".join(text_content)
+        doc = AsposeDocument(io.BytesIO(word_bytes))
+        
+        # You can set PDF save options here if needed, e.g., for compliance or compression
+        options = PdfSaveOptions()
+        # options.compliance = PdfCompliance.PDF_A_1B # Example: for PDF/A compliance
 
-
-def _extract_text_from_doc(doc_bytes: bytes) -> str:
-    """
-    Synchronously extracts plain text from a .doc file using pydocx.
-    """
-    text_content = ""
-    try:
-        html_content = PyDocX.to_html(io.BytesIO(doc_bytes))
-        cleanr = re.compile('<.*?>')
-        text_content = re.sub(cleanr, '', html_content)
+        output_stream = io.BytesIO()
+        doc.save(output_stream, options)
+        output_stream.seek(0)
+        logger.info("Aspose.Words conversion to PDF successful.")
+        return output_stream.getvalue()
     except Exception as e:
-        logger.error(f"Failed to extract text from DOC: {e}", exc_info=True)
-        raise ValueError(f"Could not read DOC file: {e}")
-    return text_content
+        logger.error(f"Failed to convert Word document to PDF using Aspose.Words: {e}", exc_info=True)
+        raise ValueError(f"Could not convert Word file to PDF: {e}")
+
+# --- Helper function for PDF text extraction (extracted from process_single_resume_file) ---
+async def _extract_text_from_pdf_bytes(pdf_bytes: bytes, original_filename: str) -> str:
+    """
+    Extracts text from PDF bytes, including OCR for images/scanned content.
+    """
+    all_extracted_text_segments = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    loop = asyncio.get_event_loop()
+    ocr_tasks = []
+
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+
+        text_from_pdf_layer = page.get_text("text")
+        if text_from_pdf_layer.strip():
+            all_extracted_text_segments.append(f"--- Page {page_num + 1} (PDF Text Layer) ---\n")
+            all_extracted_text_segments.append(text_from_pdf_layer)
+        
+        perform_full_page_ocr = False
+        native_text_len = len(text_from_pdf_layer.strip())
+
+        # Heuristic for determining if full page OCR is needed
+        if native_text_len < 100: # Very little native text
+            perform_full_page_ocr = True
+        else:
+            # Check for common sections if there's some text but might be incomplete
+            common_section_keywords = ["experience", "education", "skills", "certifications", "summary", "projects", "awards", "licenses", "certified"]
+            if not any(keyword in text_from_pdf_layer.lower() for keyword in common_section_keywords):
+                perform_full_page_ocr = True 
+
+        image_list = page.get_images(full=True)
+        for img_index, img_info in enumerate(image_list):
+            xref = img_info[0]
+            base_image = doc.extract_image(xref)
+            img_bytes = base_image.get("image")
+            img_ext = base_image.get("ext")
+
+            if not img_bytes:
+                logger.warning(f"No image bytes extracted for embedded image {img_index} on page {page_num} of '{original_filename}'.")
+                continue
+
+            if img_ext.lower() in ["png", "jpeg", "jpg", "gif", "bmp"]:
+                try:
+                    image = Image.open(io.BytesIO(img_bytes))
+                    image_np = np.array(image)
+                    
+                    ocr_task_future = loop.run_in_executor(
+                        ocr_llm_executor,
+                        reader.readtext,
+                        image_np
+                    )
+                    ocr_tasks.append(ocr_task_future)
+                    all_extracted_text_segments.append(f"--- Page {page_num + 1}, Embedded Image {img_index + 1} (OCR Scheduled) ---\n")
+                except Exception as img_e:
+                    logger.error(f"Failed to prepare embedded image {img_index} on page {page_num} of '{original_filename}' for OCR: {img_e}", exc_info=True)
+            else:
+                logger.warning(f"Skipping unsupported embedded image format '{img_ext}' on page {page_num}, image {img_index} of '{original_filename}'.")
+
+        if perform_full_page_ocr:
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(1, 1)) # Render page to pixmap at 72dpi
+                img_bytes_from_page = pix.tobytes("png") # Convert pixmap to PNG bytes
+
+                if not img_bytes_from_page:
+                    logger.warning(f"No bytes generated when rendering page {page_num} for full page OCR of '{original_filename}'.")
+                    continue
+
+                image_from_page = Image.open(io.BytesIO(img_bytes_from_page))
+                image_from_page_np = np.array(image_from_page)
+
+                ocr_task_future = loop.run_in_executor(
+                    ocr_llm_executor,
+                    reader.readtext,
+                    image_from_page_np
+                )
+                ocr_tasks.append(ocr_task_future)
+                all_extracted_text_segments.append(f"--- Page {page_num + 1} (Full Page OCR Scheduled) ---\n")
+            except Exception as e_page_ocr:
+                logger.error(f"Could not render or prepare page {page_num} of '{original_filename}' for full page OCR: {e_page_ocr}", exc_info=True)
+        else:
+            logger.debug(f"Skipping full page OCR for page {page_num} of '{original_filename}' based on content heuristics.")
+
+    doc.close()
+
+    logger.info(f"Waiting for OCR tasks for '{original_filename}' to complete...")
+    completed_ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
+    logger.info(f"All OCR tasks for '{original_filename}' completed.")
+
+    for res in completed_ocr_results:
+        if isinstance(res, Exception):
+            logger.error(f"An OCR task failed for '{original_filename}': {res}", exc_info=True)
+        else:
+            extracted_text_from_ocr = [text for (bbox, text, prob) in res]
+            if extracted_text_from_ocr:
+                combined_ocr_text_segment = "\n".join(extracted_text_from_ocr)
+                all_extracted_text_segments.append(combined_ocr_text_segment)
+    
+    return "\n".join(all_extracted_text_segments)
 
 
 async def process_single_resume_file(
@@ -256,123 +346,43 @@ async def process_single_resume_file(
 ) -> Dict[str, Any]:
     """
     Processes a single resume file (PDF, DOCX, DOC) to extract structured data.
-    This is now a helper for batch processing.
+    DOCX/DOC files are first converted to PDF using Aspose.Words.
     """
-    all_extracted_text_segments = []
+    extracted_text = ""
 
     if content_type == "application/pdf":
-        logger.info(f"Starting PDF text extraction and OCR for '{original_filename}'.")
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        loop = asyncio.get_event_loop()
-        ocr_tasks = []
-
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-
-            text_from_pdf_layer = page.get_text("text")
-            if text_from_pdf_layer.strip():
-                all_extracted_text_segments.append(f"--- Page {page_num + 1} (PDF Text Layer) ---\n")
-                all_extracted_text_segments.append(text_from_pdf_layer)
-            
-            perform_full_page_ocr = False
-            native_text_len = len(text_from_pdf_layer.strip())
-
-            # Heuristic for determining if full page OCR is needed
-            if native_text_len < 100: # Very little native text
-                perform_full_page_ocr = True
-            else:
-                # Check for common sections if there's some text but might be incomplete
-                common_section_keywords = ["experience", "education", "skills", "certifications", "summary", "projects", "awards", "licenses", "certified"]
-                if not any(keyword in text_from_pdf_layer.lower() for keyword in common_section_keywords):
-                    perform_full_page_ocr = True 
-
-            image_list = page.get_images(full=True)
-            for img_index, img_info in enumerate(image_list):
-                xref = img_info[0]
-                base_image = doc.extract_image(xref)
-                img_bytes = base_image.get("image")
-                img_ext = base_image.get("ext")
-
-                if not img_bytes:
-                    logger.warning(f"No image bytes extracted for embedded image {img_index} on page {page_num} of '{original_filename}'.")
-                    continue
-
-                if img_ext.lower() in ["png", "jpeg", "jpg", "gif", "bmp"]:
-                    try:
-                        image = Image.open(io.BytesIO(img_bytes))
-                        image_np = np.array(image)
-                        
-                        ocr_task_future = loop.run_in_executor(
-                            ocr_llm_executor,
-                            reader.readtext,
-                            image_np
-                        )
-                        ocr_tasks.append(ocr_task_future)
-                        all_extracted_text_segments.append(f"--- Page {page_num + 1}, Embedded Image {img_index + 1} (OCR Scheduled) ---\n")
-                    except Exception as img_e:
-                        logger.error(f"Failed to prepare embedded image {img_index} on page {page_num} of '{original_filename}' for OCR: {img_e}", exc_info=True)
-                else:
-                    logger.warning(f"Skipping unsupported embedded image format '{img_ext}' on page {page_num}, image {img_index} of '{original_filename}'.")
-
-            if perform_full_page_ocr:
-                try:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(1, 1)) # Render page to pixmap at 72dpi
-                    img_bytes_from_page = pix.tobytes("png") # Convert pixmap to PNG bytes
-
-                    if not img_bytes_from_page:
-                        logger.warning(f"No bytes generated when rendering page {page_num} for full page OCR of '{original_filename}'.")
-                        continue
-
-                    image_from_page = Image.open(io.BytesIO(img_bytes_from_page))
-                    image_from_page_np = np.array(image_from_page)
-
-                    ocr_task_future = loop.run_in_executor(
-                        ocr_llm_executor,
-                        reader.readtext,
-                        image_from_page_np
-                    )
-                    ocr_tasks.append(ocr_task_future)
-                    all_extracted_text_segments.append(f"--- Page {page_num + 1} (Full Page OCR Scheduled) ---\n")
-                except Exception as e_page_ocr:
-                    logger.error(f"Could not render or prepare page {page_num} of '{original_filename}' for full page OCR: {e_page_ocr}", exc_info=True)
-            else:
-                logger.debug(f"Skipping full page OCR for page {page_num} of '{original_filename}' based on content heuristics.")
-
-        doc.close()
-
-        logger.info(f"Waiting for OCR tasks for '{original_filename}' to complete...")
-        completed_ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
-        logger.info(f"All OCR tasks for '{original_filename}' completed.")
-
-        for res in completed_ocr_results:
-            if isinstance(res, Exception):
-                logger.error(f"An OCR task failed for '{original_filename}': {res}", exc_info=True)
-            else:
-                extracted_text_from_ocr = [text for (bbox, text, prob) in res]
-                if extracted_text_from_ocr:
-                    combined_ocr_text_segment = "\n".join(extracted_text_from_ocr)
-                    all_extracted_text_segments.append(combined_ocr_text_segment)
-
-    elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        logger.info(f"Starting DOCX text extraction for '{original_filename}'.")
-        # Run synchronous DOCX extraction in a thread pool
-        all_extracted_text_segments.append(await asyncio.to_thread(_extract_text_from_docx, file_bytes))
-        logger.info(f"Text extracted from DOCX '{original_filename}'.")
+        logger.info(f"Processing PDF text extraction and OCR for '{original_filename}'.")
+        extracted_text = await _extract_text_from_pdf_bytes(file_bytes, original_filename)
+        logger.info(f"Text extracted from PDF '{original_filename}'.")
         
-    elif content_type == "application/msword":
-        logger.info(f"Starting DOC text extraction for '{original_filename}'.")
-        # Run synchronous DOC extraction in a thread pool
-        all_extracted_text_segments.append(await asyncio.to_thread(_extract_text_from_doc, file_bytes))
-        logger.info(f"Text extracted from DOC '{original_filename}'.")
+    elif content_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/msword"]:
+        logger.info(f"Starting Aspose.Words conversion for '{original_filename}' (from {content_type}).")
+        
+        try:
+            # Convert DOC/DOCX to PDF first using Aspose.Words
+            loop = asyncio.get_event_loop()
+            pdf_bytes_from_word = await loop.run_in_executor(
+                ocr_llm_executor, # Use the shared executor for Aspose conversion
+                _convert_word_to_pdf_sync,
+                file_bytes
+            )
+            logger.info(f"Converted '{original_filename}' to PDF using Aspose.Words. Now extracting text from the generated PDF.")
+            
+            # Now, process the generated PDF bytes using the existing PDF extraction logic
+            extracted_text = await _extract_text_from_pdf_bytes(pdf_bytes_from_word, original_filename)
+            logger.info(f"Text extracted from generated PDF for '{original_filename}'.")
+
+        except Exception as e:
+            logger.error(f"Failed to convert Word file to PDF or extract text from it for '{original_filename}': {e}", exc_info=True)
+            # Raise the error to be caught by the calling batch process
+            raise ValueError(f"Could not process Word file: {e}")
 
     else:
         logger.error(f"Unsupported content type '{content_type}' for '{original_filename}'.")
         raise ValueError(f"Unsupported file type for processing: {content_type}")
 
-    full_resume_text = "\n".join(all_extracted_text_segments)
-
     # Basic check for empty resume text
-    if not full_resume_text.strip():
+    if not extracted_text.strip():
         logger.warning(f"Extracted no meaningful text from '{original_filename}'. Skipping LLM call.")
         return {
             "original_filename": original_filename,
@@ -389,9 +399,8 @@ async def process_single_resume_file(
             "error_message": "Could not extract text from file."
         }
 
-
     logger.info(f"Calling LLM for '{original_filename}'...")
-    parsed_resume_data, usage_info = await _call_llm_for_resume_parsing(full_resume_text)
+    parsed_resume_data, usage_info = await _call_llm_for_resume_parsing(extracted_text)
     logger.info(f"LLM parsing completed for '{original_filename}'.")
 
     # Store the original filename and the parsed data
